@@ -1,7 +1,5 @@
 """Linear-light exposure metering primitives.
 
-All public functions in this module are intentionally unimplemented: this
-repository is the failing starting point for the auto-exposure bugfix task.
 Images are plain two-dimensional ``list[list[float]]`` values (rows of
 pixels), never NumPy arrays.  Luminance and EV arithmetic is linear in light,
 not on gamma-encoded display values.  Floating-point results are expected to
@@ -24,6 +22,48 @@ LOG_LUMA_MAX = 0.0
 MID_GRAY = 0.18
 
 
+def _is_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _image_problems(img: list[list[float]]) -> list[str]:
+    """Return human-readable problems with a grayscale image (empty = valid)."""
+    problems: list[str] = []
+    if not img:
+        problems.append("image is empty")
+        return problems
+    width = None
+    for r, row in enumerate(img):
+        if not isinstance(row, Sequence) or isinstance(row, (str, bytes)):
+            problems.append(f"row {r} is not a sequence")
+            continue
+        if width is None:
+            width = len(row)
+            if width == 0:
+                problems.append("image has empty rows")
+        elif len(row) != width:
+            problems.append(
+                f"row {r} is ragged: expected {width} samples, got {len(row)}"
+            )
+        for c, sample in enumerate(row):
+            if not _is_number(sample):
+                problems.append(f"sample at ({r}, {c}) is not a number")
+                continue
+            if math.isnan(sample):
+                problems.append(f"NaN sample at ({r}, {c})")
+            elif math.isinf(sample):
+                problems.append(f"non-finite sample at ({r}, {c})")
+            elif sample < 0:
+                problems.append(f"negative sample at ({r}, {c})")
+    return problems
+
+
+def _raise_if_invalid(img: list[list[float]]) -> None:
+    problems = _image_problems(img)
+    if problems:
+        raise ExposureError("; ".join(problems))
+
+
 def luminance(img: list[list[float | Sequence[float]]]) -> list[list[float]]:
     """Return per-pixel linear relative luminance.
 
@@ -37,8 +77,62 @@ def luminance(img: list[list[float | Sequence[float]]]) -> list[list[float]]:
     image.  Returned values are linear, are not gamma encoded, and are
     compared by the tests with an absolute tolerance of ``1e-6``.
     """
+    if not img:
+        raise ExposureError("image is empty")
 
-    raise NotImplementedError("luminance is not implemented yet")
+    result: list[list[float]] = []
+    width: int | None = None
+    for r, row in enumerate(img):
+        if not isinstance(row, Sequence) or isinstance(row, (str, bytes)):
+            raise ExposureError(f"row {r} is not a sequence")
+        if width is None:
+            width = len(row)
+            if width == 0:
+                raise ExposureError("image has empty rows")
+        elif len(row) != width:
+            raise ExposureError(f"row {r} is ragged")
+
+        out_row: list[float] = []
+        for c, pixel in enumerate(row):
+            if _is_number(pixel):
+                value = float(pixel)  # type: ignore[arg-type]
+            elif isinstance(pixel, Sequence) and not isinstance(pixel, (str, bytes)):
+                if len(pixel) != 3:
+                    raise ExposureError(
+                        f"RGB pixel at ({r}, {c}) must have 3 channels"
+                    )
+                channels = []
+                for channel in pixel:
+                    if not _is_number(channel):
+                        raise ExposureError(
+                            f"RGB channel at ({r}, {c}) is not a number"
+                        )
+                    channels.append(float(channel))
+                for channel in channels:
+                    if not math.isfinite(channel):
+                        raise ExposureError(
+                            f"non-finite RGB channel at ({r}, {c})"
+                        )
+                    if channel < 0:
+                        raise ExposureError(f"negative RGB channel at ({r}, {c})")
+                # Rec.709 luma weights, not an equal-weight average.
+                value = (
+                    0.2126 * channels[0]
+                    + 0.7152 * channels[1]
+                    + 0.0722 * channels[2]
+                )
+                out_row.append(value)
+                continue
+            else:
+                raise ExposureError(f"pixel at ({r}, {c}) is not a number")
+
+            if not math.isfinite(value):
+                raise ExposureError(f"non-finite sample at ({r}, {c})")
+            if value < 0:
+                raise ExposureError(f"negative sample at ({r}, {c})")
+            out_row.append(value)
+        result.append(out_row)
+    return result
 
 
 def histogram(img: list[list[float]], bins: int) -> list[int]:
@@ -55,8 +149,21 @@ def histogram(img: list[list[float]], bins: int) -> list[int]:
     ``bins <= 0`` raises ``ExposureError``.  An empty, ragged, negative, or
     non-finite image also raises ``ExposureError``.
     """
+    if not isinstance(bins, int) or bins <= 0:
+        raise ExposureError(f"bins must be a positive integer, got {bins!r}")
+    _raise_if_invalid(img)
 
-    raise NotImplementedError("histogram is not implemented yet")
+    counts = [0] * bins
+    span = LOG_LUMA_MAX - LOG_LUMA_MIN
+    for row in img:
+        for sample in row:
+            if sample <= 0:
+                counts[0] += 1
+                continue
+            ev = min(max(math.log2(sample), LOG_LUMA_MIN), LOG_LUMA_MAX)
+            bucket = int(math.floor((ev - LOG_LUMA_MIN) / span * bins))
+            counts[min(bucket, bins - 1)] += 1
+    return counts
 
 
 def percentile(hist: list[int], p: float) -> float:
@@ -74,8 +181,62 @@ def percentile(hist: list[int], p: float) -> float:
     Returned luminance values are compared with an absolute tolerance of
     ``1e-6``.
     """
+    if not math.isfinite(p) or not 0.0 <= p <= 1.0:
+        raise ExposureError(f"p must be in [0, 1], got {p!r}")
+    total = sum(hist)
+    if total <= 0:
+        raise ExposureError("histogram has zero total count")
 
-    raise NotImplementedError("percentile is not implemented yet")
+    bins = len(hist)
+    width = (LOG_LUMA_MAX - LOG_LUMA_MIN) / bins
+    target = p * total
+
+    cumulative = 0
+    for i, count in enumerate(hist):
+        if count <= 0:
+            continue
+        if cumulative + count >= target:
+            # Interpolate linearly inside this bucket instead of returning
+            # the bucket index.
+            fraction = (target - cumulative) / count
+            fraction = min(max(fraction, 0.0), 1.0)
+            log_value = LOG_LUMA_MIN + (i + fraction) * width
+            return 2.0 ** log_value
+        cumulative += count
+
+    # target == total lands in the last non-empty bucket at its upper edge.
+    log_value = LOG_LUMA_MIN + bins * width
+    return 2.0 ** log_value
+
+
+def _region_mean(lum: list[list[float]], mode: str) -> float:
+    height = len(lum)
+    width = len(lum[0])
+
+    if mode == "matrix":
+        rows = range(0, height)
+        cols = range(0, width)
+    elif mode == "center":
+        r0, r1 = height // 4, height - height // 4
+        c0, c1 = width // 4, width - width // 4
+        rows = range(r0, r1)
+        cols = range(c0, c1)
+    elif mode == "spot":
+        side = max(1, round(0.1 * min(height, width)))
+        r0 = (height - side) // 2
+        c0 = (width - side) // 2
+        rows = range(r0, r0 + side)
+        cols = range(c0, c0 + side)
+    else:
+        raise ExposureError(f"unknown metering mode: {mode!r}")
+
+    total = 0.0
+    count = 0
+    for r in rows:
+        for c in cols:
+            total += lum[r][c]
+            count += 1
+    return total / count
 
 
 def meter_ev(img: list[list[float]], target_p: float, mode: str) -> float:
@@ -98,8 +259,15 @@ def meter_ev(img: list[list[float]], target_p: float, mode: str) -> float:
     non-finite ``target_p``, an unknown mode, or zero measured luminance.
     EV values are compared with an absolute tolerance of ``1e-6``.
     """
+    if not math.isfinite(target_p) or target_p <= 0:
+        raise ExposureError(f"target_p must be positive and finite, got {target_p!r}")
+    _raise_if_invalid(img)
 
-    raise NotImplementedError("meter_ev is not implemented yet")
+    lum = luminance(img)
+    measured = _region_mean(lum, mode)
+    if measured <= 0:
+        raise ExposureError("measured luminance is zero")
+    return math.log2(target_p / measured)
 
 
 def adapt(prev_ev: float, new_ev: float, speed: float) -> float:
@@ -112,8 +280,11 @@ def adapt(prev_ev: float, new_ev: float, speed: float) -> float:
     ``ExposureError``.  EV results are compared with an absolute tolerance of
     ``1e-6``.
     """
-
-    raise NotImplementedError("adapt is not implemented yet")
+    for name, value in (("prev_ev", prev_ev), ("new_ev", new_ev), ("speed", speed)):
+        if not math.isfinite(value):
+            raise ExposureError(f"{name} must be finite, got {value!r}")
+    clamped = min(max(speed, 0.0), 1.0)
+    return prev_ev + (new_ev - prev_ev) * clamped
 
 
 def apply_ev(img: list[list[float]], ev: float) -> list[list[float]]:
@@ -128,8 +299,15 @@ def apply_ev(img: list[list[float]], ev: float) -> list[list[float]]:
     ``ev`` must be finite, and an invalid image raises ``ExposureError``.
     Output samples are compared with an absolute tolerance of ``1e-6``.
     """
+    if not math.isfinite(ev):
+        raise ExposureError(f"ev must be finite, got {ev!r}")
+    _raise_if_invalid(img)
 
-    raise NotImplementedError("apply_ev is not implemented yet")
+    scale = 2.0 ** ev
+    return [
+        [min(max(sample * scale, 0.0), 1.0) for sample in row]
+        for row in img
+    ]
 
 
 def validate(img: list[list[float]], bins: int) -> list[str]:
@@ -142,8 +320,10 @@ def validate(img: list[list[float]], bins: int) -> list[str]:
     data; callers such as :func:`meter_ev` convert the list into an
     ``ExposureError``.
     """
-
-    raise NotImplementedError("validate is not implemented yet")
+    problems = _image_problems(img)
+    if not isinstance(bins, int) or bins <= 0:
+        problems.append(f"bins must be a positive integer, got {bins!r}")
+    return problems
 
 
 def exposure_batch(frames: list[list[list[float]]], config: dict) -> dict:
@@ -165,5 +345,26 @@ def exposure_batch(frames: list[list[list[float]]], config: dict) -> dict:
     starting from ``start_ev``.  EV values are compared with an absolute
     tolerance of ``1e-6``.
     """
+    config = config or {}
+    target_p = config.get("target_p", MID_GRAY)
+    mode = config.get("mode", "matrix")
+    speed = config.get("speed", 1.0)
+    start_ev = config.get("start_ev", 0.0)
+    bins = config.get("bins", 64)
 
-    raise NotImplementedError("exposure_batch is not implemented yet")
+    # Validate every frame up front so a bad frame aborts the whole batch.
+    for i, frame in enumerate(frames):
+        problems = validate(frame, bins)
+        if problems:
+            raise ExposureError(f"frame {i} is invalid: {'; '.join(problems)}")
+
+    # Each frame is metered from its own pixels; no state is shared.
+    evs = [meter_ev(frame, target_p, mode) for frame in frames]
+
+    adapted: list[float] = []
+    current = start_ev
+    for ev in evs:
+        current = adapt(current, ev, speed)
+        adapted.append(current)
+
+    return {"evs": evs, "adapted": adapted}
